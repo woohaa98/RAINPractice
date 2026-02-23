@@ -1,0 +1,587 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>RAIN Micropractice</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body, #root { height: 100%; min-height: 100dvh; }
+  body { background: #0f2424; overflow-x: hidden; }
+  textarea::placeholder { color: rgba(255,255,255,0.28); }
+  textarea { color-scheme: dark; }
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 99px; }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(16px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50%       { transform: translateY(-10px); }
+  }
+  @keyframes pulse-ring {
+    0%, 100% { opacity: 0.35; transform: scale(1); }
+    50%       { opacity: 0.65; transform: scale(1.06); }
+  }
+  .float { animation: float 3s ease-in-out infinite; }
+  .rain-letter { display: inline-block; animation: fadeUp 0.6s ease both; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ── Audio Engine ──────────────────────────────────────────────────────────────
+function createAmbientSound() {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const t = ctx.currentTime;
+  const allNodes = [];
+
+  // ── Master chain: gain → soft compressor → destination
+  const masterGain = ctx.createGain();
+  masterGain.gain.setValueAtTime(0, t);
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -24;
+  comp.knee.value = 30;
+  comp.ratio.value = 4;
+  comp.attack.value = 0.3;
+  comp.release.value = 1.0;
+  masterGain.connect(comp);
+  comp.connect(ctx.destination);
+
+  // ── Shared reverb (convolver with synthetic impulse) ─────────────────────
+  function makeReverb(duration = 3.5, decay = 2.5) {
+    const len = ctx.sampleRate * duration;
+    const buf = ctx.createBuffer(2, len, ctx.sampleRate);
+    for (let ch = 0; ch < 2; ch++) {
+      const data = buf.getChannelData(ch);
+      for (let i = 0; i < len; i++) {
+        data[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, decay);
+      }
+    }
+    const conv = ctx.createConvolver();
+    conv.buffer = buf;
+    return conv;
+  }
+  const reverb = makeReverb(4, 3);
+  const reverbGain = ctx.createGain();
+  reverbGain.gain.value = 0.55;
+  reverb.connect(reverbGain);
+  reverbGain.connect(masterGain);
+
+  // ── Helper: soft pad tone ─────────────────────────────────────────────────
+  // Uses a sine osc, low-pass filtered, with a very slow volume LFO for warmth
+  function addPad(freq, vol, panVal, lfoRate = 0.05) {
+    const osc = ctx.createOscillator();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(freq, t);
+    // Tiny slow drift — completely imperceptible, just removes "electronic" flatness
+    osc.frequency.setTargetAtTime(freq * 1.0008, t, 20);
+
+    const lpf = ctx.createBiquadFilter();
+    lpf.type = "lowpass";
+    lpf.frequency.value = freq * 2.8;  // cut harsh overtones
+    lpf.Q.value = 0.5;
+
+    const gainNode = ctx.createGain();
+    gainNode.gain.setValueAtTime(vol, t);
+
+    // Amplitude LFO — very slow breath-like swell
+    const lfo = ctx.createOscillator();
+    const lfoGain = ctx.createGain();
+    lfo.frequency.value = lfoRate;
+    lfoGain.gain.value = vol * 0.3;   // swell depth: 30% of base vol
+    lfo.connect(lfoGain);
+    lfoGain.connect(gainNode.gain);
+    lfo.start(t);
+
+    const panner = ctx.createStereoPanner();
+    panner.pan.value = panVal;
+
+    osc.connect(lpf);
+    lpf.connect(gainNode);
+    gainNode.connect(panner);
+    panner.connect(masterGain);   // dry signal
+    gainNode.connect(reverb);     // wet signal into reverb
+
+    osc.start(t);
+    allNodes.push(osc, lfo);
+    return osc;
+  }
+
+  // ── Soft pink-noise under-layer (feels like a gentle room) ────────────────
+  function addPinkNoise(vol) {
+    const bufSize = ctx.sampleRate * 4;
+    const buf = ctx.createBuffer(1, bufSize, ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    // Pink noise via Paul Kellet's filter
+    let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0,b6=0;
+    for (let i = 0; i < bufSize; i++) {
+      const w = Math.random() * 2 - 1;
+      b0 = 0.99886*b0 + w*0.0555179; b1 = 0.99332*b1 + w*0.0750759;
+      b2 = 0.96900*b2 + w*0.1538520; b3 = 0.86650*b3 + w*0.3104856;
+      b4 = 0.55000*b4 + w*0.5329522; b5 = -0.7616*b5 - w*0.0168980;
+      data[i] = (b0+b1+b2+b3+b4+b5+b6 + w*0.5362) * 0.11;
+      b6 = w * 0.115926;
+    }
+    const src = ctx.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+
+    const lpf = ctx.createBiquadFilter();
+    lpf.type = "lowpass";
+    lpf.frequency.value = 320;   // only very low rumble passes through
+    lpf.Q.value = 0.3;
+
+    const gainNode = ctx.createGain();
+    gainNode.gain.value = vol;
+
+    src.connect(lpf); lpf.connect(gainNode); gainNode.connect(masterGain);
+    src.start(t);
+    allNodes.push(src);
+  }
+
+  // ── Layer the sounds ──────────────────────────────────────────────────────
+  // Root note: A2 (110 Hz) — warm, grounded, not buzzy
+  addPad(110,  0.018,  0.0,  0.04);   // root — centre, very slow swell
+  addPad(165,  0.012, -0.25, 0.06);   // perfect 5th (E3) — left
+  addPad(220,  0.010,  0.25, 0.05);   // octave (A3) — right
+  addPad(275,  0.007, -0.15, 0.07);   // soft 5th above — left
+  addPad(330,  0.005,  0.15, 0.08);   // gentle major 3rd — right
+
+  addPinkNoise(0.006);   // barely-there room presence
+
+  return {
+    fadeIn() {
+      masterGain.gain.cancelScheduledValues(ctx.currentTime);
+      masterGain.gain.setValueAtTime(masterGain.gain.value, ctx.currentTime);
+      masterGain.gain.linearRampToValueAtTime(1.0, ctx.currentTime + 5); // slow 5s fade in
+    },
+    fadeOut() {
+      masterGain.gain.cancelScheduledValues(ctx.currentTime);
+      masterGain.gain.setValueAtTime(masterGain.gain.value, ctx.currentTime);
+      masterGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 3);
+    },
+    stop() {
+      try { masterGain.gain.linearRampToValueAtTime(0, ctx.currentTime + 2); } catch(e){}
+      setTimeout(() => {
+        allNodes.forEach(n => { try { n.stop(); } catch(e){} });
+        try { ctx.close(); } catch(e){}
+      }, 2500);
+    },
+  };
+}
+
+// ── Body Zones ────────────────────────────────────────────────────────────────
+const BODY_ZONES = [
+  { id:"head",           label:"Head",          cx:100, cy:36,  rx:22, ry:22 },
+  { id:"throat",         label:"Throat",        cx:100, cy:67,  rx:11, ry:9  },
+  { id:"chest",          label:"Chest",         cx:100, cy:102, rx:26, ry:20 },
+  { id:"stomach",        label:"Stomach",       cx:100, cy:140, rx:20, ry:14 },
+  { id:"belly",          label:"Belly",         cx:100, cy:168, rx:18, ry:13 },
+  { id:"left_shoulder",  label:"L. Shoulder",   cx:65,  cy:90,  rx:14, ry:12 },
+  { id:"right_shoulder", label:"R. Shoulder",   cx:135, cy:90,  rx:14, ry:12 },
+  { id:"left_arm",       label:"L. Arm",        cx:52,  cy:130, rx:11, ry:22 },
+  { id:"right_arm",      label:"R. Arm",        cx:148, cy:130, rx:11, ry:22 },
+  { id:"left_hand",      label:"L. Hand",       cx:46,  cy:170, rx:10, ry:12 },
+  { id:"right_hand",     label:"R. Hand",       cx:154, cy:170, rx:10, ry:12 },
+  { id:"hips",           label:"Hips",          cx:100, cy:196, rx:24, ry:13 },
+  { id:"left_thigh",     label:"L. Thigh",      cx:83,  cy:228, rx:13, ry:20 },
+  { id:"right_thigh",    label:"R. Thigh",      cx:117, cy:228, rx:13, ry:20 },
+  { id:"left_knee",      label:"L. Knee",       cx:83,  cy:262, rx:11, ry:10 },
+  { id:"right_knee",     label:"R. Knee",       cx:117, cy:262, rx:11, ry:10 },
+  { id:"left_leg",       label:"L. Lower Leg",  cx:83,  cy:293, rx:9,  ry:18 },
+  { id:"right_leg",      label:"R. Lower Leg",  cx:117, cy:293, rx:9,  ry:18 },
+  { id:"left_foot",      label:"L. Foot",       cx:81,  cy:323, rx:13, ry:8  },
+  { id:"right_foot",     label:"R. Foot",       cx:119, cy:323, rx:13, ry:8  },
+];
+
+function BodyMap({ selected, onToggle, color }) {
+  return (
+    <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:10}}>
+      <p style={{color:"rgba(255,255,255,0.4)",fontSize:11,letterSpacing:2.5,textTransform:"uppercase",margin:0}}>
+        Tap where you feel it
+      </p>
+      <svg viewBox="0 0 200 338" width="170" height="288" style={{display:"block",margin:"0 auto"}}>
+        <defs>
+          <radialGradient id="sil" cx="50%" cy="35%" r="65%">
+            <stop offset="0%" stopColor="rgba(255,255,255,0.11)" />
+            <stop offset="100%" stopColor="rgba(255,255,255,0.03)" />
+          </radialGradient>
+          <filter id="hglow" x="-40%" y="-40%" width="180%" height="180%">
+            <feGaussianBlur stdDeviation="4" result="blur"/>
+            <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+          </filter>
+        </defs>
+        {/* Silhouette */}
+        <ellipse cx="100" cy="36" rx="24" ry="26" fill="url(#sil)" stroke="rgba(255,255,255,0.14)" strokeWidth="1"/>
+        <rect x="91" y="60" width="18" height="14" rx="5" fill="url(#sil)" stroke="rgba(255,255,255,0.1)" strokeWidth="1"/>
+        <path d="M68 74 Q60 88 59 106 Q57 132 61 158 Q65 176 72 190 L128 190 Q135 176 139 158 Q143 132 141 106 Q140 88 132 74 Z" fill="url(#sil)" stroke="rgba(255,255,255,0.14)" strokeWidth="1"/>
+        <path d="M72 190 Q70 200 68 212 L132 212 Q130 200 128 190 Z" fill="url(#sil)" stroke="rgba(255,255,255,0.1)" strokeWidth="1"/>
+        <path d="M68 78 Q51 94 45 118 Q41 143 43 166 L56 166 Q57 143 59 117 Q64 95 76 80 Z" fill="url(#sil)" stroke="rgba(255,255,255,0.11)" strokeWidth="1"/>
+        <path d="M132 78 Q149 94 155 118 Q159 143 157 166 L144 166 Q143 143 141 117 Q136 95 124 80 Z" fill="url(#sil)" stroke="rgba(255,255,255,0.11)" strokeWidth="1"/>
+        <ellipse cx="49" cy="172" rx="12" ry="14" fill="url(#sil)" stroke="rgba(255,255,255,0.1)" strokeWidth="1"/>
+        <ellipse cx="151" cy="172" rx="12" ry="14" fill="url(#sil)" stroke="rgba(255,255,255,0.1)" strokeWidth="1"/>
+        <path d="M72 212 Q68 235 66 262 Q64 290 66 318 L88 318 Q90 290 90 262 Q90 236 88 212 Z" fill="url(#sil)" stroke="rgba(255,255,255,0.11)" strokeWidth="1"/>
+        <path d="M112 212 Q110 236 110 262 Q110 290 112 318 L134 318 Q136 290 134 262 Q132 235 128 212 Z" fill="url(#sil)" stroke="rgba(255,255,255,0.11)" strokeWidth="1"/>
+        <ellipse cx="77" cy="325" rx="14" ry="9" fill="url(#sil)" stroke="rgba(255,255,255,0.1)" strokeWidth="1"/>
+        <ellipse cx="123" cy="325" rx="14" ry="9" fill="url(#sil)" stroke="rgba(255,255,255,0.1)" strokeWidth="1"/>
+        {/* Hotspots */}
+        {BODY_ZONES.map(z => {
+          const sel = selected.includes(z.id);
+          return (
+            <g key={z.id} onClick={() => onToggle(z.id)} style={{cursor:"pointer"}}>
+              {sel && <ellipse cx={z.cx} cy={z.cy} rx={z.rx+5} ry={z.ry+5}
+                fill="none" stroke={color} strokeWidth="1" strokeOpacity="0.35"
+                strokeDasharray="3 3" style={{animation:"pulse-ring 2s ease-in-out infinite",transformOrigin:`${z.cx}px ${z.cy}px`}}/>}
+              <ellipse cx={z.cx} cy={z.cy} rx={z.rx} ry={z.ry}
+                fill={sel ? color+"55" : "transparent"}
+                stroke={sel ? color : "transparent"}
+                strokeWidth={sel ? 1.5 : 0}
+                filter={sel ? "url(#hglow)" : "none"}
+                style={{transition:"all 0.25s ease"}}/>
+              <ellipse cx={z.cx} cy={z.cy} rx={Math.max(z.rx+4,18)} ry={Math.max(z.ry+4,18)} fill="transparent"/>
+            </g>
+          );
+        })}
+      </svg>
+      {selected.length > 0 && (
+        <div style={{display:"flex",flexWrap:"wrap",gap:6,justifyContent:"center",maxWidth:260}}>
+          {selected.map(id => {
+            const z = BODY_ZONES.find(z => z.id === id);
+            return <span key={id} style={{background:color+"22",border:`1px solid ${color}55`,color:"white",fontSize:11,padding:"3px 10px",borderRadius:99}}>{z?.label}</span>;
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Config ────────────────────────────────────────────────────────────────────
+const STEPS = [
+  { key:"R", label:"Recognize", color:"#6B9E9E", icon:"👁", tagline:"Pause & notice",
+    instruction:"What are you feeling right now?", sub:"Where do you feel it in your body?",
+    placeholder:"e.g. anxious, tight, overwhelmed...", affirmation:null, duration:60, hasBodyMap:true },
+  { key:"A", label:"Allow", color:"#B07DB0", icon:"🌊", tagline:"Let it be here",
+    instruction:"You don't have to fix or push this away.", sub:"Can you give this feeling permission to exist, just for now?",
+    placeholder:"What comes up when you allow it?", affirmation:"Yes, I can allow it", duration:75, hasBreath:true },
+  { key:"I", label:"Investigate", color:"#C4945A", icon:"🔍", tagline:"Get curious",
+    instruction:"Why might you be feeling this way?", sub:"Is there a belief, fear, or trigger underneath?",
+    placeholder:"What's really going on underneath?", affirmation:null, duration:90,
+    prompts:["What triggered this?","What am I afraid of?","What do I need right now?"] },
+  { key:"N", label:"Non-Identify", color:"#7A9E7A", icon:"🌿", tagline:"You are not this feeling",
+    instruction:"This is something you're experiencing.", sub:"It does not define who you are.",
+    placeholder:"Who are you beyond this feeling?", affirmation:"I am having this feeling. It does not define me.", duration:60 },
+];
+
+// ── Timer Ring ────────────────────────────────────────────────────────────────
+function TimerRing({ duration }) {
+  const [elapsed, setElapsed] = useState(0);
+  const ref = useRef(null);
+  useEffect(() => {
+    setElapsed(0);
+    clearInterval(ref.current);
+    ref.current = setInterval(() => setElapsed(e => Math.min(e+1, duration)), 1000);
+    return () => clearInterval(ref.current);
+  }, [duration]);
+  const r = 34, circ = 2 * Math.PI * r;
+  const rem = duration - elapsed;
+  return (
+    <div style={{position:"relative",width:80,height:80}}>
+      <svg width="80" height="80" style={{transform:"rotate(-90deg)"}}>
+        <circle cx="40" cy="40" r={r} fill="none" stroke="rgba(255,255,255,0.12)" strokeWidth="4.5"/>
+        <circle cx="40" cy="40" r={r} fill="none" stroke="white" strokeWidth="4.5"
+          strokeDasharray={circ} strokeDashoffset={circ*(1-elapsed/duration)}
+          strokeLinecap="round" style={{transition:"stroke-dashoffset 1s linear"}}/>
+      </svg>
+      <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",flexDirection:"column"}}>
+        <span style={{fontSize:15,fontWeight:700,color:"white",lineHeight:1}}>
+          {Math.floor(rem/60)>0 ? `${Math.floor(rem/60)}:${(rem%60).toString().padStart(2,"0")}` : rem}
+        </span>
+        <span style={{fontSize:8,color:"rgba(255,255,255,0.5)",letterSpacing:1}}>SEC</span>
+      </div>
+    </div>
+  );
+}
+
+function BreathBubble({ active }) {
+  return (
+    <div style={{display:"flex",justifyContent:"center",alignItems:"center",height:96}}>
+      <div style={{width:active?84:56,height:active?84:56,borderRadius:"50%",background:"rgba(255,255,255,0.16)",border:"2px solid rgba(255,255,255,0.4)",transition:"all 4s ease-in-out",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:active?"0 0 36px rgba(255,255,255,0.22)":"none"}}>
+        <div style={{width:active?46:26,height:active?46:26,borderRadius:"50%",background:"rgba(255,255,255,0.32)",transition:"all 4s ease-in-out"}}/>
+      </div>
+    </div>
+  );
+}
+
+function ProgressBar({ step }) {
+  return (
+    <div style={{display:"flex",gap:8,justifyContent:"center",padding:"14px 0 4px"}}>
+      {STEPS.map((s,i) => (
+        <div key={s.key} style={{display:"flex",flexDirection:"column",alignItems:"center",gap:3}}>
+          <div style={{width:i===step?28:8,height:5,borderRadius:99,background:i<step?"rgba(255,255,255,0.72)":i===step?"white":"rgba(255,255,255,0.22)",transition:"all 0.4s ease"}}/>
+          {i===step && <span style={{fontSize:9,color:"rgba(255,255,255,0.8)",letterSpacing:1.5,fontWeight:700}}>{s.key}</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SoundBtn({ on, onToggle }) {
+  return (
+    <button onClick={onToggle} style={{background:on?"rgba(255,255,255,0.16)":"rgba(255,255,255,0.06)",border:`1px solid ${on?"rgba(255,255,255,0.38)":"rgba(255,255,255,0.18)"}`,borderRadius:99,padding:"6px 14px",cursor:"pointer",display:"flex",alignItems:"center",gap:6,color:"white",transition:"all 0.2s",fontFamily:"'Helvetica Neue',sans-serif"}}>
+      <span style={{fontSize:14}}>{on?"🔔":"🔕"}</span>
+      <span style={{fontSize:10,letterSpacing:1.5,textTransform:"uppercase",color:"rgba(255,255,255,0.75)"}}>{on?"Sound on":"Sound off"}</span>
+    </button>
+  );
+}
+
+// ── Landing ───────────────────────────────────────────────────────────────────
+function LandingScreen({ onStart, soundOn, onToggleSound }) {
+  const [breathIn, setBreatheIn] = useState(false);
+  useEffect(() => {
+    setBreatheIn(true);
+    const iv = setInterval(() => setBreatheIn(b => !b), 4000);
+    return () => clearInterval(iv);
+  }, []);
+
+  return (
+    <div style={{minHeight:"100dvh",background:"linear-gradient(160deg,#0f2424 0%,#1b3838 48%,#122a2a 100%)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"40px 24px",textAlign:"center",fontFamily:"Georgia,serif",overflowX:"hidden"}}>
+      <div style={{position:"fixed",top:-120,right:-100,width:420,height:420,borderRadius:"50%",background:"rgba(107,158,158,0.09)",pointerEvents:"none"}}/>
+      <div style={{position:"fixed",bottom:-100,left:-80,width:360,height:360,borderRadius:"50%",background:"rgba(122,158,122,0.07)",pointerEvents:"none"}}/>
+      <div style={{position:"relative",zIndex:1,maxWidth:400,width:"100%"}}>
+        <div style={{marginBottom:6}}>
+          {["R","A","I","N"].map((l,i) => (
+            <span key={l} className="rain-letter" style={{fontSize:54,fontWeight:900,letterSpacing:14,color:["#6B9E9E","#B07DB0","#C4945A","#7A9E7A"][i],animationDelay:`${i*0.12}s`}}>{l}</span>
+          ))}
+        </div>
+        <p style={{color:"rgba(255,255,255,0.45)",fontSize:11,letterSpacing:4,textTransform:"uppercase",marginBottom:38,fontFamily:"'Helvetica Neue',sans-serif"}}>
+          Mindfulness Micropractice
+        </p>
+        <BreathBubble active={breathIn}/>
+        <p style={{color:"rgba(255,255,255,0.35)",fontSize:10,letterSpacing:3,fontFamily:"'Helvetica Neue',sans-serif",textTransform:"uppercase",marginBottom:32,marginTop:8}}>
+          {breathIn ? "breathe in" : "breathe out"}
+        </p>
+        <p style={{color:"rgba(255,255,255,0.68)",fontSize:16,lineHeight:1.8,marginBottom:10,fontStyle:"italic"}}>
+          A 5-minute practice to meet<br/>whatever you're feeling
+        </p>
+        <p style={{color:"rgba(255,255,255,0.3)",fontSize:12,marginBottom:32,fontFamily:"'Helvetica Neue',sans-serif"}}>≈ 5 minutes · 4 steps</p>
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:14}}>
+          <SoundBtn on={soundOn} onToggle={onToggleSound}/>
+          <button onClick={onStart}
+            style={{background:"rgba(255,255,255,0.09)",border:"1.5px solid rgba(255,255,255,0.28)",color:"white",fontSize:13,letterSpacing:3,textTransform:"uppercase",padding:"15px 50px",borderRadius:99,cursor:"pointer",fontFamily:"'Helvetica Neue',sans-serif",backdropFilter:"blur(8px)",transition:"all 0.25s ease"}}
+            onMouseEnter={e=>{e.target.style.background="rgba(255,255,255,0.18)";e.target.style.transform="translateY(-2px)"}}
+            onMouseLeave={e=>{e.target.style.background="rgba(255,255,255,0.09)";e.target.style.transform="translateY(0)"}}>
+            Begin
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Step Screen ───────────────────────────────────────────────────────────────
+function StepScreen({ stepIndex, onNext, onBack, totalSteps, soundOn, onToggleSound }) {
+  const step = STEPS[stepIndex];
+  const [text, setText] = useState("");
+  const [affirmed, setAffirmed] = useState(false);
+  const [activePrompt, setActivePrompt] = useState(null);
+  const [entered, setEntered] = useState(false);
+  const [breathIn, setBreatheIn] = useState(false);
+  const [bodySelected, setBodySelected] = useState([]);
+
+  useEffect(() => {
+    setText(""); setAffirmed(false); setActivePrompt(null); setBodySelected([]); setEntered(false);
+    const t = setTimeout(() => setEntered(true), 60);
+    let iv;
+    if (step.hasBreath) { setBreatheIn(true); iv = setInterval(() => setBreatheIn(b => !b), 4000); }
+    return () => { clearTimeout(t); clearInterval(iv); };
+  }, [stepIndex]);
+
+  const toggleBody = useCallback(id => setBodySelected(p => p.includes(id) ? p.filter(x=>x!==id) : [...p,id]), []);
+
+  const gradMap = {
+    R:"linear-gradient(160deg,#0f2424 0%,#1a3c3c 55%,#142828 100%)",
+    A:"linear-gradient(160deg,#1e0e1e 0%,#321632 55%,#22102a 100%)",
+    I:"linear-gradient(160deg,#1c1204 0%,#302004 55%,#261808 100%)",
+    N:"linear-gradient(160deg,#0a180a 0%,#163016 55%,#0e1c0e 100%)"
+  };
+
+  return (
+    <div style={{minHeight:"100dvh",background:gradMap[step.key],display:"flex",flexDirection:"column",fontFamily:"'Helvetica Neue',sans-serif",transition:"background 0.7s ease"}}>
+      <div style={{position:"fixed",top:-140,right:-100,width:420,height:420,borderRadius:"50%",background:step.color+"12",pointerEvents:"none",transition:"background 0.7s"}}/>
+
+      {/* Header */}
+      <div style={{padding:"12px 18px 0",flexShrink:0}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+          <button onClick={onBack} style={{background:"transparent",border:"none",color:"rgba(255,255,255,0.4)",fontSize:26,cursor:"pointer",padding:"4px 8px",lineHeight:1}}>‹</button>
+          <TimerRing duration={step.duration}/>
+          <SoundBtn on={soundOn} onToggle={onToggleSound}/>
+        </div>
+        <ProgressBar step={stepIndex}/>
+      </div>
+
+      {/* Scrollable content */}
+      <div style={{flex:1,overflowY:"auto",padding:"18px 22px 48px",opacity:entered?1:0,transform:entered?"translateY(0)":"translateY(18px)",transition:"all 0.45s ease",maxWidth:520,margin:"0 auto",width:"100%"}}>
+
+        {/* Step header */}
+        <div style={{display:"flex",alignItems:"center",gap:14,marginBottom:20}}>
+          <div style={{width:62,height:62,borderRadius:"50%",background:step.color+"25",border:`1.5px solid ${step.color}55`,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>
+            <span style={{fontSize:24}}>{step.icon}</span>
+          </div>
+          <div>
+            <p style={{color:step.color,fontSize:10,letterSpacing:3,textTransform:"uppercase",margin:"0 0 2px",fontWeight:700}}>{step.tagline}</p>
+            <h1 style={{color:"white",fontSize:25,fontWeight:800,margin:0,fontFamily:"Georgia,serif",letterSpacing:-0.3}}>{step.label}</h1>
+          </div>
+        </div>
+
+        {/* Instruction card */}
+        <div style={{background:"rgba(255,255,255,0.055)",borderRadius:16,padding:"16px 18px",marginBottom:18,borderLeft:`2.5px solid ${step.color}50`}}>
+          <p style={{color:"white",fontSize:16,lineHeight:1.55,margin:0}}>{step.instruction}</p>
+          <p style={{color:"rgba(255,255,255,0.48)",fontSize:13,lineHeight:1.6,margin:"6px 0 0",fontStyle:"italic"}}>{step.sub}</p>
+        </div>
+
+        {/* Body map */}
+        {step.hasBodyMap && (
+          <div style={{background:"rgba(255,255,255,0.04)",borderRadius:20,border:"1px solid rgba(255,255,255,0.09)",padding:"16px 10px",marginBottom:16}}>
+            <BodyMap selected={bodySelected} onToggle={toggleBody} color={step.color}/>
+          </div>
+        )}
+
+        {/* Breath */}
+        {step.hasBreath && (
+          <div style={{textAlign:"center",marginBottom:10}}>
+            <BreathBubble active={breathIn}/>
+            <p style={{color:"rgba(255,255,255,0.33)",fontSize:10,letterSpacing:2.5,textTransform:"uppercase",marginTop:4}}>
+              {breathIn?"breathe in":"breathe out"}
+            </p>
+          </div>
+        )}
+
+        {/* Prompts */}
+        {step.prompts && (
+          <div style={{display:"flex",gap:8,flexWrap:"wrap",marginBottom:14}}>
+            {step.prompts.map(p => (
+              <button key={p} onClick={()=>setActivePrompt(activePrompt===p?null:p)}
+                style={{background:activePrompt===p?step.color+"32":"rgba(255,255,255,0.06)",border:`1px solid ${activePrompt===p?step.color:"rgba(255,255,255,0.14)"}`,color:activePrompt===p?"white":"rgba(255,255,255,0.52)",fontSize:12,padding:"7px 13px",borderRadius:99,cursor:"pointer",transition:"all 0.2s",fontFamily:"'Helvetica Neue',sans-serif"}}>
+                {p}
+              </button>
+            ))}
+          </div>
+        )}
+
+        {/* Affirmation */}
+        {step.affirmation && (
+          <button onClick={()=>setAffirmed(!affirmed)}
+            style={{background:affirmed?step.color+"26":"rgba(255,255,255,0.04)",border:`1.5px solid ${affirmed?step.color:"rgba(255,255,255,0.16)"}`,color:affirmed?"white":"rgba(255,255,255,0.52)",fontSize:14,lineHeight:1.5,padding:"13px 17px",borderRadius:14,cursor:"pointer",textAlign:"left",transition:"all 0.3s",marginBottom:14,display:"flex",alignItems:"center",gap:12,width:"100%",fontFamily:"'Helvetica Neue',sans-serif"}}>
+            <span style={{width:22,height:22,borderRadius:"50%",flexShrink:0,background:affirmed?step.color:"transparent",border:`2px solid ${affirmed?step.color:"rgba(255,255,255,0.26)"}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,color:"white",transition:"all 0.3s"}}>
+              {affirmed?"✓":""}
+            </span>
+            <span style={{fontStyle:"italic"}}>{step.affirmation}</span>
+          </button>
+        )}
+
+        {/* Text input */}
+        <textarea value={text} onChange={e=>setText(e.target.value)} placeholder={step.placeholder} rows={3}
+          style={{width:"100%",background:"rgba(255,255,255,0.05)",border:"1px solid rgba(255,255,255,0.12)",borderRadius:14,color:"white",fontSize:15,lineHeight:1.6,padding:"12px 14px",resize:"none",outline:"none",fontFamily:"'Helvetica Neue',sans-serif",boxSizing:"border-box",transition:"border-color 0.2s",display:"block"}}
+          onFocus={e=>e.target.style.borderColor=step.color+"65"}
+          onBlur={e=>e.target.style.borderColor="rgba(255,255,255,0.12)"}/>
+        <p style={{fontSize:10,color:"rgba(255,255,255,0.2)",margin:"4px 0 0",textAlign:"right"}}>optional — internal reflection is equally valid</p>
+
+        {/* Next */}
+        <button onClick={onNext}
+          style={{background:step.color,border:"none",color:"white",fontSize:13,letterSpacing:2,textTransform:"uppercase",fontWeight:700,padding:"16px 32px",borderRadius:99,cursor:"pointer",width:"100%",marginTop:22,transition:"all 0.2s",boxShadow:`0 8px 24px ${step.color}40`,fontFamily:"'Helvetica Neue',sans-serif"}}
+          onMouseEnter={e=>e.target.style.transform="translateY(-2px)"}
+          onMouseLeave={e=>e.target.style.transform="translateY(0)"}>
+          {stepIndex===totalSteps-1?"Complete ✦":"Continue →"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Closing ───────────────────────────────────────────────────────────────────
+function ClosingScreen({ onRestart, soundOn, onToggleSound }) {
+  const [entered, setEntered] = useState(false);
+  useEffect(() => { const t = setTimeout(() => setEntered(true), 100); return () => clearTimeout(t); }, []);
+  return (
+    <div style={{minHeight:"100dvh",background:"linear-gradient(160deg,#0a180a 0%,#142814 52%,#0c160c 100%)",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",padding:"40px 28px",textAlign:"center",fontFamily:"'Helvetica Neue',sans-serif"}}>
+      <div style={{position:"fixed",inset:0,pointerEvents:"none",background:"radial-gradient(circle at 50% 42%,rgba(122,158,122,0.13) 0%,transparent 68%)"}}/>
+      <div style={{position:"relative",zIndex:1,maxWidth:420,width:"100%",opacity:entered?1:0,transform:entered?"translateY(0)":"translateY(24px)",transition:"all 0.8s ease"}}>
+        <div className="float" style={{fontSize:52,marginBottom:18}}>🌿</div>
+        <h1 style={{color:"white",fontSize:26,fontWeight:700,margin:"0 0 10px",fontFamily:"Georgia,serif",lineHeight:1.3}}>Practice complete</h1>
+        <p style={{color:"rgba(255,255,255,0.52)",fontSize:15,lineHeight:1.85,fontStyle:"italic",marginBottom:36}}>
+          You gave yourself 5 minutes<br/>of compassionate attention.<br/>That matters.
+        </p>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:32}}>
+          {STEPS.map(s => (
+            <div key={s.key} style={{background:"rgba(255,255,255,0.05)",border:`1px solid ${s.color}32`,borderRadius:14,padding:"12px 14px",textAlign:"left"}}>
+              <p style={{color:s.color,fontSize:9,letterSpacing:2.5,textTransform:"uppercase",margin:"0 0 3px",fontWeight:700}}>{s.key}</p>
+              <p style={{color:"rgba(255,255,255,0.75)",fontSize:13,margin:"0 0 4px"}}>{s.label}</p>
+              <span style={{fontSize:18}}>{s.icon}</span>
+            </div>
+          ))}
+        </div>
+        <div style={{display:"flex",flexDirection:"column",alignItems:"center",gap:12}}>
+          <SoundBtn on={soundOn} onToggle={onToggleSound}/>
+          <button onClick={onRestart}
+            style={{background:"rgba(255,255,255,0.08)",border:"1.5px solid rgba(255,255,255,0.2)",color:"white",fontSize:12,letterSpacing:2.5,textTransform:"uppercase",padding:"14px 40px",borderRadius:99,cursor:"pointer",width:"100%",transition:"all 0.2s",fontFamily:"'Helvetica Neue',sans-serif"}}
+            onMouseEnter={e=>e.target.style.background="rgba(255,255,255,0.15)"}
+            onMouseLeave={e=>e.target.style.background="rgba(255,255,255,0.08)"}>
+            Practice Again
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Root ──────────────────────────────────────────────────────────────────────
+function RAINApp() {
+  const [screen, setScreen] = useState("landing");
+  const [stepIndex, setStepIndex] = useState(0);
+  const [soundOn, setSoundOn] = useState(false);
+  const audioRef = useRef(null);
+
+  const toggleSound = useCallback(() => {
+    if (!soundOn) {
+      if (!audioRef.current) audioRef.current = createAmbientSound();
+      audioRef.current.fadeIn();
+      setSoundOn(true);
+    } else {
+      if (audioRef.current) audioRef.current.fadeOut();
+      setSoundOn(false);
+    }
+  }, [soundOn]);
+
+  useEffect(() => () => { if (audioRef.current) audioRef.current.stop(); }, []);
+
+  const handleStart   = () => { setStepIndex(0); setScreen("step"); };
+  const handleNext    = () => { if (stepIndex < STEPS.length-1) setStepIndex(i=>i+1); else setScreen("done"); };
+  const handleBack    = () => { if (stepIndex===0) setScreen("landing"); else setStepIndex(i=>i-1); };
+  const handleRestart = () => {
+    setStepIndex(0); setScreen("landing");
+    if (audioRef.current) { audioRef.current.stop(); audioRef.current=null; }
+    setSoundOn(false);
+  };
+
+  const shared = { soundOn, onToggleSound: toggleSound };
+  if (screen==="landing") return <LandingScreen onStart={handleStart} {...shared}/>;
+  if (screen==="step")    return <StepScreen stepIndex={stepIndex} onNext={handleNext} onBack={handleBack} totalSteps={STEPS.length} {...shared}/>;
+  if (screen==="done")    return <ClosingScreen onRestart={handleRestart} {...shared}/>;
+  return null;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<RAINApp/>);
+</script>
+</body>
+</html>
